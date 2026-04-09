@@ -45,3 +45,6 @@ venv/
 # Project specific
 .myai/
 config.json
+resume/
+todo.py
+docs/

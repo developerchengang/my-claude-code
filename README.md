@@ -6,6 +6,8 @@ A local command-line tool that uses natural language to create and edit files th
 
 - **File Creation**: Create new files with natural language commands
 - **File Editing**: Insert, delete, or replace lines with user confirmation
+- **Agentic Loop**: Multi-turn tool execution - AI can use multiple tools in sequence to complete complex tasks
+- **File Reference**: Use `@filename` to include file contents in your request
 - **Safety First**: All modifications require `y/N` confirmation
 - **Snapshots & Undo**: Automatic backups before changes, `/undo` to restore
 - **Path Security**: Prevents access to files outside the project directory
@@ -43,6 +45,13 @@ On first run, the setup wizard will guide you through API configuration.
 > Replace lines 1-2 in readme.md with # New Title
 ```
 
+### Reference file contents
+
+```
+> Explain what @main.py does
+> Add tests for the function in @tools.py
+```
+
 ### Slash Commands
 
 | Command | Description |
@@ -74,7 +83,8 @@ Settings are stored in `~/.myai/settings.json`:
 - OpenAI (api.openai.com)
 - SiliconFlow (siliconflow.cn)
 - Ollama (localhost:11434)
-- Any OpenAI-compatible API
+- MiniMax (Anthropic-compatible)
+- Any OpenAI-compatible or Anthropic-compatible API
 
 ## Safety Mechanisms
 
@@ -86,7 +96,7 @@ Settings are stored in `~/.myai/settings.json`:
 ## Requirements
 
 - Python 3.9+
-- OpenAI-compatible API key
+- OpenAI-compatible or Anthropic-compatible API key
 
 ## License
 
