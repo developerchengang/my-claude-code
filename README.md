@@ -5,7 +5,9 @@ A local command-line tool that uses natural language to create and edit files th
 ## Features
 
 - **File Creation**: Create new files with natural language commands
-- **File Editing**: Insert, delete, or replace lines with user confirmation
+- **File Editing**: Replace text strings with user confirmation (Claude Code style)
+- **File Search**: Search files with regex patterns (grep)
+- **Read Before Edit**: Must read file content before editing
 - **Agentic Loop**: Multi-turn tool execution - AI can use multiple tools in sequence to complete complex tasks
 - **File Reference**: Use `@filename` to include file contents in your request
 - **Safety First**: All modifications require `y/N` confirmation
@@ -40,9 +42,15 @@ On first run, the setup wizard will guide you through API configuration.
 ### Edit a file
 
 ```
-> Insert a new line after line 3 in config.json
-> Delete lines 5-10 in main.py
-> Replace lines 1-2 in readme.md with # New Title
+> Change "foo" to "bar" in config.json
+> Replace all occurrences of "TODO" with "DONE" in main.py
+```
+
+### Search files
+
+```
+> Find all files containing "TODO"
+> Search for "function_name" in *.py files
 ```
 
 ### Reference file contents
