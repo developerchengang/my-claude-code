@@ -132,26 +132,19 @@ class FileReadTool:
         return entry["content"] if entry else None
 
 
-class FileTools:
-    """Handles file operations with security checks and snapshots."""
-
-    SNAPSHOT_DIR = Path(".myai") / "file-history"
+class FileWriteTool:
+    """Tool for creating new files."""
 
     def __init__(self, project_root: Optional[Path] = None):
         self.project_root = project_root or Path.cwd()
-        self._pending_edit: Optional[PendingEdit] = None
-        # Reference to FileReadTool for validating reads (set externally)
-        self._read_tool: Optional[FileReadTool] = None
 
     def _validate_path(self, file_path: str) -> Path:
         """Resolve and validate that a path is within the project directory."""
-        # Handle relative paths
         if not Path(file_path).is_absolute():
             resolved = (self.project_root / file_path).resolve()
         else:
             resolved = Path(file_path).resolve()
 
-        # Security check: ensure path is within project root
         try:
             resolved.relative_to(self.project_root)
         except ValueError:
@@ -161,26 +154,6 @@ class FileTools:
             )
 
         return resolved
-
-    def _get_snapshot_dir(self, file_path: Path) -> Path:
-        """Get the snapshot directory for a given file path."""
-        # Create a unique identifier from the file path
-        path_hash = hashlib.md5(str(file_path).encode()).hexdigest()
-        return self.SNAPSHOT_DIR / path_hash
-
-    def _create_snapshot(self, file_path: Path) -> Path:
-        """Create a snapshot backup of a file."""
-        snapshot_dir = self._get_snapshot_dir(file_path)
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create timestamped filename
-        timestamp = int(time.time() * 1000)
-        filename = f"{timestamp}_{file_path.name}"
-        snapshot_path = snapshot_dir / filename
-
-        # Copy file to snapshot
-        shutil.copy2(file_path, snapshot_path)
-        return snapshot_path
 
     def create_file(self, file_path: str, content: str) -> Dict[str, Any]:
         """
@@ -243,6 +216,51 @@ class FileTools:
         except OSError as e:
             raise FileToolError(f"Failed to create file: {e}")
 
+
+class FileEditTool:
+    """Tool for editing existing files with snapshots and undo."""
+
+    SNAPSHOT_DIR = Path(".myai") / "file-history"
+
+    def __init__(self, project_root: Optional[Path] = None, read_tool: Optional[FileReadTool] = None):
+        self.project_root = project_root or Path.cwd()
+        self._read_tool = read_tool
+        self._pending_edit: Optional[PendingEdit] = None
+
+    def _validate_path(self, file_path: str) -> Path:
+        """Resolve and validate that a path is within the project directory."""
+        if not Path(file_path).is_absolute():
+            resolved = (self.project_root / file_path).resolve()
+        else:
+            resolved = Path(file_path).resolve()
+
+        try:
+            resolved.relative_to(self.project_root)
+        except ValueError:
+            raise PathSecurityError(
+                f"Access denied: '{file_path}' is outside the project directory. "
+                f"Only files within '{self.project_root}' are accessible."
+            )
+
+        return resolved
+
+    def _get_snapshot_dir(self, file_path: Path) -> Path:
+        """Get the snapshot directory for a given file path."""
+        path_hash = hashlib.md5(str(file_path).encode()).hexdigest()
+        return self.SNAPSHOT_DIR / path_hash
+
+    def _create_snapshot(self, file_path: Path) -> Path:
+        """Create a snapshot backup of a file."""
+        snapshot_dir = self._get_snapshot_dir(file_path)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = int(time.time() * 1000)
+        filename = f"{timestamp}_{file_path.name}"
+        snapshot_path = snapshot_dir / filename
+
+        shutil.copy2(file_path, snapshot_path)
+        return snapshot_path
+
     def edit_file(
         self,
         file_path: str,
@@ -254,7 +272,6 @@ class FileTools:
         Edit a file by replacing old_string with new_string.
 
         IMPORTANT: File must be read first using FileReadTool.read_file() before editing.
-        This ensures LLM sees the content before making changes.
 
         Args:
             file_path: Path to the file to edit
@@ -287,11 +304,9 @@ class FileTools:
             if cached is not None:
                 original_content = cached
             else:
-                # Fallback to reading file
                 with open(resolved_path, "r", encoding="utf-8") as f:
                     original_content = f.read()
         else:
-            # File was not read first - require it for Claude Code workflow
             raise FileToolError(
                 f"File '{file_path}' has not been read yet. "
                 f"Please read the file first using read_file() before editing."
@@ -306,13 +321,11 @@ class FileTools:
                 )
             new_content = new_string
         else:
-            # Find the old_string in content
             if old_string not in original_content:
                 raise FileToolError(
                     f"String to replace not found in file: {repr(old_string[:100])}"
                 )
 
-            # Check if there are multiple matches
             count = original_content.count(old_string)
             if count > 1 and not replace_all:
                 raise FileToolError(
@@ -320,7 +333,6 @@ class FileTools:
                     f"Use replace_all=True to replace all occurrences."
                 )
 
-            # Perform replacement
             if replace_all:
                 new_content = original_content.replace(old_string, new_string)
             else:
@@ -389,18 +401,15 @@ class FileTools:
         Returns:
             Dict with 'success' and 'message'.
         """
-        # Find the latest snapshot directory
         if not self.SNAPSHOT_DIR.exists():
             return {
                 "success": False,
                 "message": "No snapshots found. Nothing to undo.",
             }
 
-        # Find all snapshot directories
-        snapshot_dirs = []
-        for item in self.SNAPSHOT_DIR.iterdir():
-            if item.is_dir():
-                snapshot_dirs.append(item)
+        snapshot_dirs = [
+            item for item in self.SNAPSHOT_DIR.iterdir() if item.is_dir()
+        ]
 
         if not snapshot_dirs:
             return {
@@ -408,7 +417,6 @@ class FileTools:
                 "message": "No snapshots found. Nothing to undo.",
             }
 
-        # Find the most recent snapshot across all directories
         latest_snapshot = None
         latest_time = 0
 
@@ -426,29 +434,17 @@ class FileTools:
                 "message": "No snapshots found. Nothing to undo.",
             }
 
-        # Get the original file path from the snapshot filename
         # Format: {timestamp}_{original_filename}
         parts = latest_snapshot.stem.split("_", 1)
-        if len(parts) > 1:
-            original_filename = parts[1]
-        else:
-            original_filename = latest_snapshot.name
+        original_filename = parts[1] if len(parts) > 1 else latest_snapshot.name
 
-        # Try to find the original file in project root
         original_path = self.project_root / original_filename
 
-        # If the file still exists, create a snapshot of it first
         if original_path.exists():
             self._create_snapshot(original_path)
 
         try:
-            # Restore from snapshot
-            if original_path.parent != latest_snapshot.parent:
-                # Copy to original location
-                shutil.copy2(latest_snapshot, original_path)
-            else:
-                # Already in same directory, just restore content
-                shutil.copy2(latest_snapshot, original_path)
+            shutil.copy2(latest_snapshot, original_path)
 
             return {
                 "success": True,

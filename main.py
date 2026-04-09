@@ -32,7 +32,7 @@ BANNER = r"""[bold cyan]
 from config import Config, is_configured, _run_setup_wizard
 from history import SessionHistory
 from llm import LLMClient, ToolCall
-from tools import FileTools, FileReadTool, GrepTool, PathSecurityError, FileToolError
+from tools import FileWriteTool, FileEditTool, FileReadTool, GrepTool, PathSecurityError, FileToolError
 
 
 class SlashCommandCompleter(Completer):
@@ -43,8 +43,7 @@ class SlashCommandCompleter(Completer):
     # Ignore patterns for file index
     IGNORE_DIRS = {'__pycache__', '.git', '.pytest_cache', '.myai', 'node_modules', '.claude', 'docs', 'tests', '.env'}
 
-    def __init__(self, file_tools: FileTools):
-        self.file_tools = file_tools
+    def __init__(self, file_tools: FileEditTool):
         self.path_completer = PathCompleter()
         # Build file index at startup
         self.file_index = self._build_file_index()
@@ -114,11 +113,10 @@ class ClaudeCLI:
         self.console = Console()
         self.config = Config()
         self.history = SessionHistory()
-        self.file_tools = FileTools()
         self.read_tool = FileReadTool()
+        self.write_tool = FileWriteTool()
+        self.edit_tool = FileEditTool(read_tool=self.read_tool)
         self.grep_tool = GrepTool()
-        # Link read_tool to file_tools for edit validation
-        self.file_tools._read_tool = self.read_tool
         self.llm: Optional[LLMClient] = None
         self._pending_confirmation = False
         self._last_tool_cancelled = False
@@ -283,7 +281,7 @@ class ClaudeCLI:
 
     def _undo(self) -> None:
         """Undo the last file edit."""
-        result = self.file_tools.undo_last()
+        result = self.edit_tool.undo_last()
         if result["success"]:
             self.console.print(f"[green]\u2713[/green] {result['message']}")
         else:
@@ -310,7 +308,7 @@ class ClaudeCLI:
 
         # Create prompt session
         session = PromptSession(
-            completer=SlashCommandCompleter(self.file_tools),
+            completer=SlashCommandCompleter(self.edit_tool),
             key_bindings=self._kb,
             auto_suggest=AutoSuggestFromHistory(),
         )
@@ -495,16 +493,15 @@ class ClaudeCLI:
                         # File exists but user wants to modify content
                         # Must read first, then edit
                         self.read_tool.read_file(file_path)
-                        result = self.file_tools.edit_file(
+                        result = self.edit_tool.edit_file(
                             file_path,
                             old_string=self.read_tool.get_read_content(file_path),
                             new_string=args["content"]
                         )
                     else:
-                        result = self.file_tools.create_file(args["file_path"], args["content"])
+                        result = self.write_tool.create_file(args["file_path"], args["content"])
                 elif tool_name == "edit_file":
-                    # New Claude Code style: old_string + new_string
-                    result = self.file_tools.edit_file(
+                    result = self.edit_tool.edit_file(
                         args["file_path"],
                         old_string=args.get("old_string"),
                         new_string=args.get("new_string"),
@@ -612,7 +609,7 @@ class ClaudeCLI:
 
             if "content" in result and "diff" not in result:
                 # This was a create operation
-                create_result = self.file_tools.confirm_create(
+                create_result = self.write_tool.confirm_create(
                     file_path,
                     result.get("content", "")
                 )
@@ -623,7 +620,7 @@ class ClaudeCLI:
                 self.history.add_message("tool", create_result["message"], tool_call_id=tool_call_id)
             else:
                 # This was an edit operation
-                edit_result = self.file_tools.confirm_edit()
+                edit_result = self.edit_tool.confirm_edit()
                 if edit_result["success"]:
                     self.console.print(f"[green]\u2713[/green] {edit_result['message']}")
                 else:
