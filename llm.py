@@ -220,10 +220,13 @@ class LLMClient:
             return LLMResponse(content="", tool_calls=[])
 
         message = choices[0].message
+        if message is None:
+            return LLMResponse(content="", tool_calls=[])
+
         content = message.content or ""
 
         tool_calls = []
-        for tc in message.tool_calls or []:
+        for tc in (message.tool_calls or []):
             if tc.type == "function":
                 func = tc.function
                 try:
@@ -286,7 +289,7 @@ class LLMClient:
         content = ""
         tool_calls = []
 
-        for block in response.content:
+        for block in (response.content or []):
             if block.type == "text":
                 content += block.text
             elif block.type == "tool_use":

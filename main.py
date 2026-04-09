@@ -1,5 +1,7 @@
 """Main CLI program for Claude CLI."""
 
+import glob
+import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -34,13 +36,50 @@ from tools import FileTools, FileReadTool, GrepTool, PathSecurityError, FileTool
 
 
 class SlashCommandCompleter(Completer):
-    """Custom completer for slash commands and file paths."""
+    """Custom completer for slash commands, file paths, and @ file references."""
 
     COMMANDS = ["/undo", "/clear", "/history", "/help", "/exit", "/settings"]
+
+    # Ignore patterns for file index
+    IGNORE_DIRS = {'__pycache__', '.git', '.pytest_cache', '.myai', 'node_modules', '.claude', 'docs', 'tests', '.env'}
 
     def __init__(self, file_tools: FileTools):
         self.file_tools = file_tools
         self.path_completer = PathCompleter()
+        # Build file index at startup
+        self.file_index = self._build_file_index()
+
+    def _build_file_index(self) -> List[str]:
+        """Build a list of files for @ autocomplete."""
+        files = []
+        for root, dirs, filenames in os.walk('.'):
+            # Filter out ignored directories in-place
+            dirs[:] = [d for d in dirs if d not in self.IGNORE_DIRS]
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+                filepath = os.path.join(root, filename)
+                # Use forward slashes for consistency
+                files.append(filepath.lstrip('./').replace('\\', '/'))
+        return sorted(files)
+
+    def _get_at_query(self, text: str) -> tuple[str, str]:
+        """Extract query and line range from @ text.
+
+        Returns:
+            (query, line_range) - e.g., ("config", "#L10-20") or ("conf", "")
+        """
+        # Handle @filepath#L10-20 format
+        if '#L' in text:
+            at_part = text[:text.index('#L')]
+            line_range = text[text.index('#L'):]
+        else:
+            at_part = text
+            line_range = ""
+
+        # Extract query (remove @ prefix)
+        query = at_part[1:] if at_part.startswith('@') else at_part
+        return query, line_range
 
     def get_completions(self, document, complete_event):
         """Generate completions based on input."""
@@ -51,6 +90,15 @@ class SlashCommandCompleter(Completer):
             for cmd in self.COMMANDS:
                 if cmd.startswith(text):
                     yield Completion(cmd, start_position=-len(text))
+
+        # If starts with @, complete file references
+        elif text.startswith("@"):
+            query, line_range = self._get_at_query(text)
+            for filepath in self.file_index:
+                if query in filepath:
+                    # Append line range if present in original text
+                    completion_text = f"@{filepath}{line_range}"
+                    yield Completion(completion_text, start_position=-len(text))
 
         # If starts with a path, complete file paths
         elif "/" in text or (len(text) > 1 and text[0] == "."):
@@ -87,6 +135,29 @@ class ClaudeCLI:
                 event.app.exit()
             else:
                 event.app.exit()
+
+        @self._kb.add(Keys.Tab)
+        def trigger_completion(event):
+            """Tab: trigger completion if none active."""
+            buffer = event.app.current_buffer
+            if not buffer.complete_state:
+                buffer.start_completion()
+
+        @self._kb.add(Keys.ControlJ)
+        def accept_completion_only(event):
+            """Ctrl+J: accept completion and stay in input."""
+            buffer = event.app.current_buffer
+            if buffer.complete_state:
+                buffer.complete_state = None
+
+        @self._kb.add(Keys.Enter, eager=True)
+        def handle_enter(event):
+            """Enter: accept completion without submitting when menu is active."""
+            buffer = event.app.current_buffer
+            if buffer.complete_state:
+                buffer.complete_state = None
+            else:
+                buffer.validate_and_handle()
 
     def _run_setup_wizard(self) -> None:
         """Run the initial setup wizard."""
@@ -202,7 +273,8 @@ class ClaudeCLI:
     def _show_history(self) -> None:
         """Display conversation history summary."""
         summary = self.history.get_summary()
-        self.console.print(f"[dim]{summary}[/dim]")
+        from rich.markup import escape
+        self.console.print(f"[dim]{escape(summary)}[/dim]")
 
     def _clear_history(self) -> None:
         """Clear conversation history."""
@@ -261,6 +333,31 @@ class ClaudeCLI:
             # Process user message
             self._process_user_message(user_input)
 
+    def _call_llm_with_retry(self, messages, max_retries=3):
+        """Call LLM with retry for transient errors (429, 500)."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                response = self.llm.chat(messages)
+                if response.content or response.tool_calls:
+                    return response
+                # Empty response - retry if not last attempt
+                if attempt < max_retries - 1:
+                    self.console.print(f"[dim]Empty response, retrying ({attempt + 2}/{max_retries})...[/dim]")
+                    time.sleep(2)
+                    continue
+                return response
+            except Exception as e:
+                err_str = str(e)
+                # Retry on 429 (rate limit) and 500 (server error)
+                if attempt < max_retries - 1 and ('429' in err_str or '500' in err_str):
+                    wait = 3 * (attempt + 1)
+                    self.console.print(f"[dim]API error, retrying in {wait}s ({attempt + 2}/{max_retries})...[/dim]")
+                    time.sleep(wait)
+                    continue
+                raise
+        return self.llm.chat(messages)
+
     def _process_user_message(self, message: str) -> None:
         """Process a user message through the LLM with agentic loop support."""
         # Expand @file references
@@ -285,7 +382,7 @@ class ClaudeCLI:
                     "[dim]Thinking...[/dim]",
                     spinner="dots",
                 ):
-                    response = self.llm.chat(messages)
+                    response = self._call_llm_with_retry(messages)
             except Exception as e:
                 self.console.print(f"[red]\u2717 Error calling LLM:[/red] {e}")
                 return
@@ -295,6 +392,8 @@ class ClaudeCLI:
                 if response.content:
                     self._display_markdown(response.content)
                     self.history.add_message("assistant", response.content)
+                else:
+                    self.console.print("[yellow]AI returned empty response. The API may be unstable, please try again.[/yellow]")
                 break
 
             # Execute tools and continue loop
@@ -333,7 +432,9 @@ class ClaudeCLI:
         def replace_match(match):
             filename = match.group(1)
             try:
-                # Try relative to current working directory
+                # Strip leading slashes to avoid Windows drive-root resolution
+                # e.g. Path.cwd() / "/foo" → "C:\foo" on Windows
+                filename = filename.lstrip("/\\")
                 file_path = Path(filename)
                 if not file_path.is_absolute():
                     file_path = Path.cwd() / file_path

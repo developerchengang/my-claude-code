@@ -48,3 +48,4 @@ config.json
 resume/
 todo.py
 docs/
+tests/
