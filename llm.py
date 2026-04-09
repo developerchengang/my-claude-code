@@ -29,8 +29,40 @@ OPENAI_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. MUST be called before edit_file to ensure you know the current content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Path to the file to read"}
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for a pattern in file contents using regex.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "File or directory to search in"},
+                    "glob": {"type": "string", "description": "Glob pattern to filter files (e.g., *.py)"},
+                    "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"], "description": "Output format"},
+                    "case_insensitive": {"type": "boolean", "description": "Case insensitive search"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_file",
-            "description": "Create a new file with the specified content in the project directory.",
+            "description": "Create a new file with the specified content.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -45,26 +77,16 @@ OPENAI_TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Edit an existing file with the specified operations.",
+            "description": "Edit an existing file by replacing old_string with new_string. File must be read first using read_file.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {"type": "string"},
-                    "operations": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "action": {"type": "string", "enum": ["insert", "delete", "replace"]},
-                                "start_line": {"type": "integer"},
-                                "end_line": {"type": "integer"},
-                                "content": {"type": "string"}
-                            },
-                            "required": ["action", "start_line"]
-                        }
-                    }
+                    "old_string": {"type": "string", "description": "The exact string to find and replace (must match exactly)"},
+                    "new_string": {"type": "string", "description": "The replacement string"},
+                    "replace_all": {"type": "boolean", "description": "Replace all occurrences? Default false."}
                 },
-                "required": ["file_path", "operations"]
+                "required": ["file_path", "old_string", "new_string"]
             }
         }
     }
@@ -73,8 +95,34 @@ OPENAI_TOOL_DEFINITIONS = [
 # Anthropic tool definitions
 ANTHROPIC_TOOL_DEFINITIONS = [
     {
+        "name": "read_file",
+        "description": "Read the contents of a file. MUST be called before edit_file to ensure you know the current content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file to read"}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "grep",
+        "description": "Search for a pattern in file contents using regex.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                "path": {"type": "string", "description": "File or directory to search in"},
+                "glob": {"type": "string", "description": "Glob pattern to filter files"},
+                "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"]},
+                "case_insensitive": {"type": "boolean"}
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
         "name": "create_file",
-        "description": "Create a new file with the specified content in the project directory.",
+        "description": "Create a new file with the specified content.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -86,26 +134,16 @@ ANTHROPIC_TOOL_DEFINITIONS = [
     },
     {
         "name": "edit_file",
-        "description": "Edit an existing file with the specified operations.",
+        "description": "Edit an existing file by replacing old_string with new_string. File must be read first.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string"},
-                "operations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "action": {"type": "string", "enum": ["insert", "delete", "replace"]},
-                            "start_line": {"type": "integer"},
-                            "end_line": {"type": "integer"},
-                            "content": {"type": "string"}
-                        },
-                        "required": ["action", "start_line"]
-                    }
-                }
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"}
             },
-            "required": ["file_path", "operations"]
+            "required": ["file_path", "old_string", "new_string"]
         }
     }
 ]

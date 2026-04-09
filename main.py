@@ -30,7 +30,7 @@ BANNER = r"""[bold cyan]
 from config import Config, is_configured, _run_setup_wizard
 from history import SessionHistory
 from llm import LLMClient, ToolCall
-from tools import FileTools, PathSecurityError, FileToolError
+from tools import FileTools, FileReadTool, GrepTool, PathSecurityError, FileToolError
 
 
 class SlashCommandCompleter(Completer):
@@ -67,6 +67,10 @@ class ClaudeCLI:
         self.config = Config()
         self.history = SessionHistory()
         self.file_tools = FileTools()
+        self.read_tool = FileReadTool()
+        self.grep_tool = GrepTool()
+        # Link read_tool to file_tools for edit validation
+        self.file_tools._read_tool = self.read_tool
         self.llm: Optional[LLMClient] = None
         self._pending_confirmation = False
         self._last_tool_cancelled = False
@@ -376,20 +380,58 @@ class ClaudeCLI:
             self.console.print(f"[dim]\u2699 Calling tool: [cyan]{tool_name}[/cyan]...[/dim]")
 
             try:
-                if tool_name == "create_file":
+                if tool_name == "read_file":
+                    result = self.read_tool.read_file(args["file_path"])
+                    # Ensure message field exists for reporting
+                    if "message" not in result:
+                        result["message"] = result.get("content", "")[:500]
+                elif tool_name == "create_file":
                     # Check if user intent is to edit existing file
                     file_path = args.get("file_path", "")
                     target_path = Path(file_path) if Path(file_path).is_absolute() else Path.cwd() / file_path
 
                     if target_path.exists() and args.get("content"):
                         # File exists but user wants to modify content
-                        # Treat as edit: replace entire content
-                        operations = [{"action": "replace", "start_line": 1, "end_line": 999999, "content": args["content"]}]
-                        result = self.file_tools.edit_file(file_path, operations)
+                        # Must read first, then edit
+                        self.read_tool.read_file(file_path)
+                        result = self.file_tools.edit_file(
+                            file_path,
+                            old_string=self.read_tool.get_read_content(file_path),
+                            new_string=args["content"]
+                        )
                     else:
                         result = self.file_tools.create_file(args["file_path"], args["content"])
                 elif tool_name == "edit_file":
-                    result = self.file_tools.edit_file(args["file_path"], args["operations"])
+                    # New Claude Code style: old_string + new_string
+                    result = self.file_tools.edit_file(
+                        args["file_path"],
+                        old_string=args.get("old_string"),
+                        new_string=args.get("new_string"),
+                        replace_all=args.get("replace_all", False)
+                    )
+                elif tool_name == "grep":
+                    grep_result = self.grep_tool.search(
+                        pattern=args["pattern"],
+                        path=args.get("path"),
+                        glob=args.get("glob"),
+                        output_mode=args.get("output_mode", "files_with_matches"),
+                        case_insensitive=args.get("case_insensitive", False),
+                        head_limit=args.get("head_limit"),
+                    )
+                    # Convert GrepResult to dict with message
+                    if grep_result.content:
+                        message = grep_result.content
+                    else:
+                        message = f"Found {grep_result.num_files} file(s): {', '.join(grep_result.filenames[:10])}"
+                        if grep_result.num_files > 10:
+                            message += f" ... and {grep_result.num_files - 10} more"
+                    result = {
+                        "success": True,
+                        "message": message,
+                        "content": grep_result.content or "\n".join(grep_result.filenames),
+                        "num_files": grep_result.num_files,
+                        "filenames": grep_result.filenames,
+                    }
                 else:
                     result = {"success": False, "message": f"Unknown tool: {tool_name}"}
 
