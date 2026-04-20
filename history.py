@@ -14,9 +14,17 @@ SESSIONS_DIR = ".myai/sessions"
 
 
 class SessionHistory:
-    """Append-only conversation log for the current session."""
+    """Append-only conversation log for the current session.
 
-    def __init__(self, history_file: Optional[Path] = None):
+    When ``persist=False`` the instance is ephemeral — used by sub-agents so
+    they don't leave transcript files for each invocation.
+    """
+
+    def __init__(self, history_file: Optional[Path] = None, persist: bool = True):
+        self.persist = persist
+        if not persist:
+            self.history_file = None
+            return
         if history_file is None:
             # Lazy: file is created on first add_message, so an empty session
             # leaves no artifact on disk.
@@ -32,6 +40,8 @@ class SessionHistory:
         tool_calls: Optional[List[Dict]] = None,
         tool_call_id: Optional[str] = None,
     ) -> None:
+        if not self.persist:
+            return
         message: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "role": role,
@@ -49,10 +59,11 @@ class SessionHistory:
         """Switch writes to an existing session file and return its messages."""
         messages = _load_all(path)
         self.history_file = path
+        self.persist = True
         return messages
 
     def clear(self) -> None:
-        if self.history_file.exists():
+        if self.persist and self.history_file and self.history_file.exists():
             self.history_file.unlink()
 
 

@@ -53,8 +53,10 @@ class Agent:
     KEEP_RECENT_ON_COMPACT = 2
     MAX_FILE_INLINE_CHARS = 5000
 
-    # Tools that mutate the filesystem; blocked in plan mode.
+    # Tools that mutate the filesystem; blocked in plan mode or for sub-agents.
     WRITE_TOOLS = frozenset({"create_file", "edit_file"})
+    # Tools hidden from sub-agents (so they cannot recursively spawn).
+    SUBAGENT_DISABLED_TOOLS = frozenset({"task"})
 
     PLAN_MODE_SYSTEM = (
         "You are in PLAN MODE. Do NOT modify any files. "
@@ -71,18 +73,23 @@ class Agent:
         config: Config,
         console: Console,
         confirm_callback: ConfirmCallback,
+        readonly: bool = False,
+        persist_history: bool = True,
+        can_spawn_subagents: bool = True,
     ):
         self.llm = llm
         self.config = config
         self.console = console
         self._confirm = confirm_callback
+        self.readonly = readonly
+        self.can_spawn = can_spawn_subagents
 
         self.read_tool = FileReadTool()
         self.write_tool = FileWriteTool()
         self.edit_tool = FileEditTool(read_tool=self.read_tool)
         self.grep_tool = GrepTool()
 
-        self.history = SessionHistory()
+        self.history = SessionHistory(persist=persist_history)
         self.messages: List[Dict[str, Any]] = []
         self.last_input_tokens = 0
         self.last_output_tokens = 0
@@ -225,9 +232,10 @@ class Agent:
     # ---- LLM plumbing -------------------------------------------------
 
     def _call_llm_with_retry(self, messages, max_retries: int = 3) -> LLMResponse:
+        disabled = self.SUBAGENT_DISABLED_TOOLS if not self.can_spawn else None
         for attempt in range(max_retries):
             try:
-                response = self.llm.chat(messages)
+                response = self.llm.chat(messages, disabled_tools=disabled)
                 if response.content or response.tool_calls:
                     self._record_usage(response)
                     return response
@@ -249,7 +257,7 @@ class Agent:
                     time.sleep(wait)
                     continue
                 raise
-        final = self.llm.chat(messages)
+        final = self.llm.chat(messages, disabled_tools=disabled)
         self._record_usage(final)
         return final
 
@@ -384,14 +392,15 @@ class Agent:
         name = tool_call.name
         args = tool_call.arguments
 
-        if self.plan_mode and name in self.WRITE_TOOLS:
+        if (self.plan_mode or self.readonly) and name in self.WRITE_TOOLS:
+            reason = "plan mode" if self.plan_mode else "read-only sub-agent context"
             return {
                 "success": False,
-                "message": (
-                    f"Tool '{name}' is disabled in plan mode. "
-                    "Produce a plan instead, or ask the user to exit plan mode."
-                ),
+                "message": f"Tool '{name}' is disabled ({reason}).",
             }
+
+        if name == "task":
+            return self._run_subagent(args.get("description", ""))
 
         if name == "read_file":
             result = self.read_tool.read_file(args["file_path"])
@@ -446,6 +455,44 @@ class Agent:
             }
 
         return {"success": False, "message": f"Unknown tool: {name}"}
+
+    def _run_subagent(self, description: str) -> Dict[str, Any]:
+        """Spawn an isolated, read-only sub-agent. Return its final report.
+
+        The sub-agent has its own messages list (fresh context), no jsonl
+        persistence, no write tools, and no access to the ``task`` tool —
+        preventing recursive spawning.
+        """
+        description = (description or "").strip()
+        if not description:
+            return {"success": False, "message": "task: description is required."}
+        if not self.can_spawn:
+            return {
+                "success": False,
+                "message": "task: sub-agents cannot spawn further sub-agents.",
+            }
+
+        preview = description if len(description) <= 80 else description[:77] + "..."
+        self.console.print(f"[magenta]\u229b sub-agent:[/magenta] [dim]{preview}[/dim]")
+
+        sub = Agent(
+            llm=self.llm,
+            config=self.config,
+            console=self.console,
+            confirm_callback=lambda _r: False,  # sub can't write anyway
+            readonly=True,
+            persist_history=False,
+            can_spawn_subagents=False,
+        )
+        sub.process(description)
+
+        for m in reversed(sub.messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                return {
+                    "success": True,
+                    "message": m["content"],
+                }
+        return {"success": False, "message": "Sub-agent produced no final report."}
 
     def _handle_tool_result(self, tool_call_id: str, result: Dict[str, Any]) -> bool:
         """Print feedback, persist message, request confirmation if needed.

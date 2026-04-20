@@ -91,6 +91,31 @@ OPENAI_TOOL_DEFINITIONS = [
                 "required": ["file_path", "old_string", "new_string"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": (
+                "Spawn a read-only sub-agent to investigate a question in an "
+                "isolated context. Use this for open-ended exploration (e.g. "
+                "'find all call sites of X', 'summarize how Y works across "
+                "these files') when the intermediate search/read steps would "
+                "clutter the main conversation. The sub-agent CANNOT modify "
+                "files and its middle work is not exposed — only its final "
+                "report is returned as the tool result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed task the sub-agent should complete. Be specific about what report you expect back."
+                    }
+                },
+                "required": ["description"]
+            }
+        }
     }
 ]
 
@@ -147,6 +172,21 @@ ANTHROPIC_TOOL_DEFINITIONS = [
             },
             "required": ["file_path", "old_string", "new_string"]
         }
+    },
+    {
+        "name": "task",
+        "description": (
+            "Spawn a read-only sub-agent to investigate a question in an "
+            "isolated context. Returns only the sub-agent's final report, "
+            "not its intermediate tool calls."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Detailed task for the sub-agent."}
+            },
+            "required": ["description"]
+        }
     }
 ]
 
@@ -189,18 +229,25 @@ class LLMClient:
     def chat(
         self,
         messages: List[Dict[str, str]],
-        tools: bool = True
+        tools: bool = True,
+        disabled_tools: Optional[set] = None,
     ) -> LLMResponse:
-        """Send a chat message to the LLM."""
+        """Send a chat message to the LLM.
+
+        ``disabled_tools`` removes specific tool names from the definitions
+        exposed to the model — used so sub-agents don't see the ``task``
+        tool (preventing recursive spawning).
+        """
         if self.provider == "anthropic":
-            return self._chat_anthropic(messages, tools)
+            return self._chat_anthropic(messages, tools, disabled_tools)
         else:
-            return self._chat_openai(messages, tools)
+            return self._chat_openai(messages, tools, disabled_tools)
 
     def _chat_openai(
         self,
         messages: List[Dict[str, str]],
-        tools: bool
+        tools: bool,
+        disabled_tools: Optional[set] = None,
     ) -> LLMResponse:
         """Call OpenAI-compatible API."""
         client = self._get_openai_client()
@@ -212,7 +259,10 @@ class LLMClient:
         }
 
         if tools:
-            payload["tools"] = OPENAI_TOOL_DEFINITIONS
+            defs = OPENAI_TOOL_DEFINITIONS
+            if disabled_tools:
+                defs = [d for d in defs if d["function"]["name"] not in disabled_tools]
+            payload["tools"] = defs
             payload["tool_choice"] = "auto"
 
         response = client.chat.completions.create(**payload)
@@ -253,7 +303,8 @@ class LLMClient:
     def _chat_anthropic(
         self,
         messages: List[Dict[str, str]],
-        tools: bool
+        tools: bool,
+        disabled_tools: Optional[set] = None,
     ) -> LLMResponse:
         """Call Anthropic-compatible API."""
         client = self._get_anthropic_client()
@@ -290,7 +341,10 @@ class LLMClient:
             request_kwargs["system"] = "\n\n".join(system_parts)
 
         if tools:
-            request_kwargs["tools"] = ANTHROPIC_TOOL_DEFINITIONS
+            defs = ANTHROPIC_TOOL_DEFINITIONS
+            if disabled_tools:
+                defs = [d for d in defs if d["name"] not in disabled_tools]
+            request_kwargs["tools"] = defs
 
         if self.temperature:
             request_kwargs["temperature"] = self.temperature
