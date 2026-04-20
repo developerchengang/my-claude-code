@@ -249,7 +249,11 @@ class Agent:
                 return response
             except Exception as e:
                 err = str(e)
-                if attempt < max_retries - 1 and ("429" in err or "500" in err):
+                # Transient upstream errors worth retrying. 529 is Anthropic's
+                # "overloaded" signal — common under load spikes and usually
+                # clears within a few seconds.
+                transient = any(code in err for code in ("429", "500", "502", "503", "504", "529"))
+                if attempt < max_retries - 1 and transient:
                     wait = 3 * (attempt + 1)
                     self.console.print(
                         f"[dim]API error, retrying in {wait}s ({attempt + 2}/{max_retries})...[/dim]"
