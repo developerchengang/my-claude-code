@@ -39,7 +39,7 @@ class SlashCommandCompleter(Completer):
 
     COMMANDS = [
         "/undo", "/clear", "/history", "/resume", "/context",
-        "/compact", "/help", "/exit", "/settings", "/memory",
+        "/compact", "/plan", "/help", "/exit", "/settings", "/memory",
     ]
 
     IGNORE_DIRS = {
@@ -153,7 +153,13 @@ class ClaudeCLI:
 
         while True:
             try:
-                user_input = session.prompt("\u276f ")
+                from prompt_toolkit.formatted_text import FormattedText
+                prompt_fragments = (
+                    [("ansicyan bold", "plan \u276f ")]
+                    if self.agent.plan_mode
+                    else [("", "\u276f ")]
+                )
+                user_input = session.prompt(FormattedText(prompt_fragments))
             except KeyboardInterrupt:
                 continue
 
@@ -197,6 +203,7 @@ class ClaudeCLI:
             "/resume": self._resume,
             "/context": self._show_context,
             "/compact": self._compact,
+            "/plan": self._toggle_plan,
         }
         handler = handlers.get(cmd)
         if handler:
@@ -277,6 +284,7 @@ class ClaudeCLI:
             ("/resume", "Continue the most recent previous session"),
             ("/context", "Show token usage vs. model's context window"),
             ("/compact", "Summarize history to free up context"),
+            ("/plan", "Toggle read-only plan mode (no file writes)"),
             ("/clear", "Clear the current session"),
             ("/undo", "Undo the last file edit"),
             ("/memory", "Show loaded memory (CLAUDE.md files)"),
@@ -410,6 +418,18 @@ class ClaudeCLI:
 
     def _compact(self) -> None:
         self.agent.compact()
+
+    def _toggle_plan(self) -> None:
+        self.agent.plan_mode = not self.agent.plan_mode
+        if self.agent.plan_mode:
+            self.console.print(
+                "[cyan]\u25b6 Plan mode ON[/cyan] — file writes blocked. "
+                "The model will produce a plan only."
+            )
+        else:
+            self.console.print(
+                "[green]\u25cf Plan mode OFF[/green] — file writes re-enabled."
+            )
 
     def _undo(self) -> None:
         result = self.agent.undo_last_edit()

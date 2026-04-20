@@ -52,6 +52,18 @@ class Agent:
     KEEP_RECENT_ON_COMPACT = 2
     MAX_FILE_INLINE_CHARS = 5000
 
+    # Tools that mutate the filesystem; blocked in plan mode.
+    WRITE_TOOLS = frozenset({"create_file", "edit_file"})
+
+    PLAN_MODE_SYSTEM = (
+        "You are in PLAN MODE. Do NOT modify any files. "
+        "Use only read_file and grep to inspect the codebase. "
+        "Produce a concrete, step-by-step plan listing exact file paths and the "
+        "changes you intend to make, then stop and wait for the user to exit "
+        "plan mode. If the user asks to proceed without exiting, remind them to "
+        "run /plan to leave plan mode."
+    )
+
     def __init__(
         self,
         llm: LLMClient,
@@ -73,6 +85,7 @@ class Agent:
         self.messages: List[Dict[str, Any]] = []
         self.last_input_tokens = 0
         self.last_output_tokens = 0
+        self.plan_mode = False
 
     # ---- public API ---------------------------------------------------
 
@@ -242,6 +255,8 @@ class Agent:
         system_prompt = build_system_prompt()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if self.plan_mode:
+            messages.append({"role": "system", "content": self.PLAN_MODE_SYSTEM})
         messages.extend(self.messages)
         return messages
 
@@ -336,6 +351,15 @@ class Agent:
     def _dispatch_tool(self, tool_call: ToolCall) -> Dict[str, Any]:
         name = tool_call.name
         args = tool_call.arguments
+
+        if self.plan_mode and name in self.WRITE_TOOLS:
+            return {
+                "success": False,
+                "message": (
+                    f"Tool '{name}' is disabled in plan mode. "
+                    "Produce a plan instead, or ask the user to exit plan mode."
+                ),
+            }
 
         if name == "read_file":
             result = self.read_tool.read_file(args["file_path"])
