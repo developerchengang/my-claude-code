@@ -250,17 +250,17 @@ class LLMClient:
         """Call Anthropic-compatible API."""
         client = self._get_anthropic_client()
 
-        # Convert messages to Anthropic format
+        # Convert messages to Anthropic format. System messages must go in the
+        # top-level `system` parameter, not inside the messages array.
+        system_parts: List[str] = []
         anthropic_messages = []
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content", "")
 
             if role == "system":
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": f"[System: {content}]"
-                })
+                if content:
+                    system_parts.append(content)
             elif role in ("user", "assistant"):
                 anthropic_messages.append({
                     "role": role,
@@ -277,6 +277,9 @@ class LLMClient:
             "messages": anthropic_messages,
             "max_tokens": 4096,
         }
+
+        if system_parts:
+            request_kwargs["system"] = "\n\n".join(system_parts)
 
         if tools:
             request_kwargs["tools"] = ANTHROPIC_TOOL_DEFINITIONS
