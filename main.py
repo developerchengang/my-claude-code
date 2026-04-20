@@ -46,13 +46,14 @@ from config import Config, is_configured, _run_setup_wizard
 from history import SessionHistory, list_sessions, preview_session
 from llm import LLMClient, ToolCall
 from memory import build_system_prompt, get_memory_sources
+from models import get_context_window, estimate_tokens
 from tools import FileWriteTool, FileEditTool, FileReadTool, GrepTool, PathSecurityError, FileToolError
 
 
 class SlashCommandCompleter(Completer):
     """Custom completer for slash commands, file paths, and @ file references."""
 
-    COMMANDS = ["/undo", "/clear", "/history", "/resume", "/help", "/exit", "/settings", "/memory"]
+    COMMANDS = ["/undo", "/clear", "/history", "/resume", "/context", "/compact", "/help", "/exit", "/settings", "/memory"]
 
     # Ignore patterns for file index
     IGNORE_DIRS = {'__pycache__', '.git', '.pytest_cache', '.myai', 'node_modules', '.claude', 'docs', 'tests', '.env'}
@@ -130,6 +131,10 @@ class ClaudeCLI:
         # In-memory LLM-format context. Starts empty on every launch; populated
         # by new user messages or /resume. Persistence lives in self.history.
         self.messages: List[Dict[str, Any]] = []
+        # Last LLM call's token usage — updated after every chat(). Drives the
+        # /context display and the auto-compact threshold.
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
         self.read_tool = FileReadTool()
         self.write_tool = FileWriteTool()
         self.edit_tool = FileEditTool(read_tool=self.read_tool)
@@ -230,6 +235,12 @@ class ClaudeCLI:
         elif cmd == "/resume":
             self._resume()
             return True
+        elif cmd == "/context":
+            self._show_context()
+            return True
+        elif cmd == "/compact":
+            self._compact()
+            return True
 
         return False
 
@@ -315,6 +326,8 @@ class ClaudeCLI:
         commands_table.add_row("/settings", "Display current configuration")
         commands_table.add_row("/history", "Show current session's messages")
         commands_table.add_row("/resume", "Continue the most recent previous session")
+        commands_table.add_row("/context", "Show token usage vs. model's context window")
+        commands_table.add_row("/compact", "Summarize history to free up context")
         commands_table.add_row("/clear", "Clear the current session")
         commands_table.add_row("/undo", "Undo the last file edit")
         commands_table.add_row("/memory", "Show loaded memory (CLAUDE.md files)")
@@ -422,6 +435,112 @@ class ClaudeCLI:
             f"— {len(self.messages)} message(s) loaded."
         )
 
+    AUTO_COMPACT_THRESHOLD = 0.8  # compact when last request used >80% of window
+    KEEP_RECENT_ON_COMPACT = 2    # user/assistant messages to preserve verbatim
+
+    def _show_context(self) -> None:
+        """Show token usage against the current model's context window."""
+        model = self.config.model
+        window = get_context_window(model)
+        used = self.last_input_tokens
+
+        # Fall back to a rough estimate when no LLM call has happened yet.
+        if used == 0 and self.messages:
+            used = sum(estimate_tokens(m.get("content", "")) for m in self.messages)
+            source = "estimated"
+        else:
+            source = "last API response"
+
+        pct = (used / window * 100) if window else 0.0
+        bar_width = 30
+        filled = min(bar_width, int(bar_width * used / window)) if window else 0
+        bar = "[green]" + "\u2588" * filled + "[/green][dim]" + "\u2591" * (bar_width - filled) + "[/dim]"
+
+        table = Table(show_header=False, border_style="dim", pad_edge=False)
+        table.add_column("", style="bold cyan", width=14)
+        table.add_column("")
+        table.add_row("Model", model)
+        table.add_row("Window", f"{window:,} tokens")
+        table.add_row("Used", f"{used:,} tokens ({pct:.1f}%) [dim]· {source}[/dim]")
+        table.add_row("", bar)
+        table.add_row("Last output", f"{self.last_output_tokens:,} tokens")
+        table.add_row("Messages", f"{len(self.messages)}")
+
+        self.console.print(Panel(
+            table, title="[bold]Context usage[/bold]",
+            border_style="cyan", padding=(0, 2),
+        ))
+
+    def _compact(self) -> None:
+        """Summarize the in-memory history via the LLM and replace it.
+
+        Keeps the last few user/assistant messages verbatim so the immediate
+        context survives the compression. Tool messages are dropped from the
+        tail because they would dangle without their preceding tool_calls.
+        """
+        if len(self.messages) < 3:
+            self.console.print("[dim]Nothing meaningful to compact.[/dim]")
+            return
+        if self.llm is None:
+            self.console.print("[red]\u2717 LLM not initialized.[/red]")
+            return
+
+        summary_request = list(self.messages) + [{
+            "role": "user",
+            "content": (
+                "Summarize the conversation above for use as a replacement context. "
+                "Be specific about: the user's goal, decisions made, files touched "
+                "(with paths), code changes applied, and any open questions. "
+                "Write in the same language as the conversation. Do not invent details."
+            ),
+        }]
+
+        try:
+            with self.console.status("[dim]Compacting conversation...[/dim]", spinner="dots"):
+                response = self.llm.chat(summary_request, tools=False)
+            summary = response.content.strip()
+        except Exception as e:
+            self.console.print(f"[red]\u2717 Compact failed:[/red] {e}")
+            return
+
+        if not summary:
+            self.console.print("[red]\u2717 LLM returned empty summary; keeping history as-is.[/red]")
+            return
+
+        recent: List[Dict[str, Any]] = []
+        for m in reversed(self.messages):
+            if len(recent) >= self.KEEP_RECENT_ON_COMPACT:
+                break
+            if m.get("role") in ("user", "assistant"):
+                recent.insert(0, m)
+
+        old_count = len(self.messages)
+        self.messages = [
+            {"role": "system", "content": f"[Prior conversation summary]\n{summary}"}
+        ] + recent
+
+        # Force a fresh usage measurement on the next real call. Otherwise the
+        # just-finished summarization (which saw the full pre-compact context)
+        # would keep auto-compact armed.
+        self.last_input_tokens = 0
+
+        self.console.print(
+            f"[green]\u2713[/green] Compacted {old_count} messages "
+            f"into summary + {len(recent)} recent message(s)."
+        )
+
+    def _maybe_auto_compact(self) -> None:
+        """Compact automatically if the last request got close to the window."""
+        window = get_context_window(self.config.model)
+        if not window or not self.last_input_tokens:
+            return
+        if self.last_input_tokens / window >= self.AUTO_COMPACT_THRESHOLD:
+            pct = self.last_input_tokens / window * 100
+            self.console.print(
+                f"[yellow]\u26a0 Context at {pct:.0f}% of window — auto-compacting...[/yellow]"
+            )
+            self._compact()
+
     def _show_memory(self) -> None:
         """Display which CLAUDE.md files are loaded into the system prompt."""
         sources = get_memory_sources()
@@ -522,6 +641,7 @@ class ClaudeCLI:
             try:
                 response = self.llm.chat(messages)
                 if response.content or response.tool_calls:
+                    self._record_usage(response)
                     return response
                 # Empty response - retry if not last attempt
                 if attempt < max_retries - 1:
@@ -538,7 +658,16 @@ class ClaudeCLI:
                     time.sleep(wait)
                     continue
                 raise
-        return self.llm.chat(messages)
+        final = self.llm.chat(messages)
+        self._record_usage(final)
+        return final
+
+    def _record_usage(self, response) -> None:
+        """Store the last LLM call's input/output tokens for /context + auto-compact."""
+        if response.input_tokens:
+            self.last_input_tokens = response.input_tokens
+        if response.output_tokens:
+            self.last_output_tokens = response.output_tokens
 
     def _process_user_message(self, message: str) -> None:
         """Process a user message through the LLM with agentic loop support."""
@@ -551,6 +680,10 @@ class ClaudeCLI:
         # Add user message to history
         self._append_message("user", expanded_message)
         _trace("User message added to history")
+
+        # Auto-compact check: if the previous call already consumed most of the
+        # window, shrink history before we send another request that would blow it.
+        self._maybe_auto_compact()
 
         # Agentic loop: keep calling LLM until it returns no more tool calls
         MAX_TOOL_LOOPS = 10

@@ -22,6 +22,8 @@ class LLMResponse:
     """Represents a response from the LLM."""
     content: str
     tool_calls: List[ToolCall] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # OpenAI tool definitions (function calling format)
@@ -240,7 +242,13 @@ class LLMClient:
                     arguments=args
                 ))
 
-        return LLMResponse(content=content, tool_calls=tool_calls)
+        usage = getattr(response, "usage", None)
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        )
 
     def _chat_anthropic(
         self,
@@ -302,4 +310,10 @@ class LLMClient:
                     arguments=block.input
                 ))
 
-        return LLMResponse(content=content, tool_calls=tool_calls)
+        usage = getattr(response, "usage", None)
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+        )
