@@ -13,7 +13,7 @@ from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
@@ -22,23 +22,37 @@ from rich.table import Table
 from rich.text import Text
 from rich.status import Status
 
-BANNER = r"""[bold cyan]
-╭────────────────────────────────────╮
-│  My Claude Code                    │
-╰────────────────────────────────────╯
-[dim]        AI-powered file assistant[/dim]
-[dim]      type [cyan]/help[/cyan] for commands[/dim]"""
+APP_VERSION = "0.1"
+
+_DEBUG = os.environ.get("MYAI_DEBUG") == "1"
+
+
+def _trace(msg: str) -> None:
+    """Emit a trace log to stderr when MYAI_DEBUG=1, otherwise silent.
+
+    Separates debug noise from the interactive UI (which owns stdout).
+    """
+    if _DEBUG:
+        print(f"[TRACE] {msg}", file=sys.stderr)
+
+MASCOT = r"""   ╭──────╮
+   │ o  o │
+   │ \__/ │
+   ╰─┬──┬─╯
+     │  │
+    _┴──┴_"""
 
 from config import Config, is_configured, _run_setup_wizard
-from history import SessionHistory
+from history import SessionHistory, list_sessions, preview_session
 from llm import LLMClient, ToolCall
+from memory import build_system_prompt, get_memory_sources
 from tools import FileWriteTool, FileEditTool, FileReadTool, GrepTool, PathSecurityError, FileToolError
 
 
 class SlashCommandCompleter(Completer):
     """Custom completer for slash commands, file paths, and @ file references."""
 
-    COMMANDS = ["/undo", "/clear", "/history", "/help", "/exit", "/settings"]
+    COMMANDS = ["/undo", "/clear", "/history", "/resume", "/help", "/exit", "/settings", "/memory"]
 
     # Ignore patterns for file index
     IGNORE_DIRS = {'__pycache__', '.git', '.pytest_cache', '.myai', 'node_modules', '.claude', 'docs', 'tests', '.env'}
@@ -113,6 +127,9 @@ class ClaudeCLI:
         self.console = Console()
         self.config = Config()
         self.history = SessionHistory()
+        # In-memory LLM-format context. Starts empty on every launch; populated
+        # by new user messages or /resume. Persistence lives in self.history.
+        self.messages: List[Dict[str, Any]] = []
         self.read_tool = FileReadTool()
         self.write_tool = FileWriteTool()
         self.edit_tool = FileEditTool(read_tool=self.read_tool)
@@ -207,8 +224,87 @@ class ClaudeCLI:
         elif cmd == "/undo":
             self._undo()
             return True
+        elif cmd == "/memory":
+            self._show_memory()
+            return True
+        elif cmd == "/resume":
+            self._resume()
+            return True
 
         return False
+
+    def _render_banner(self):
+        """Build a two-column welcome banner (inspired by Claude Code's start screen).
+
+        Left column: greeting + mascot + current config (model, provider, cwd).
+        Right column: Tips (common commands) + Memory status (loaded CLAUDE.md files).
+        """
+        model = self.config.get("model", "?")
+        provider = self.config.get("provider", "?")
+        cwd = str(Path.cwd())
+
+        welcome = Text("Welcome back!", style="bold white")
+        mascot = Text(MASCOT, style="bold cyan")
+        config_line = Text.assemble(
+            (model, "bold green"),
+            ("  ·  ", "dim"),
+            (provider, "cyan"),
+        )
+        cwd_line = Text(cwd, style="dim")
+
+        left = Group(
+            Align.center(welcome),
+            Text(""),
+            Align.center(mascot),
+            Text(""),
+            Align.center(config_line),
+            Align.center(cwd_line),
+        )
+
+        # Right column: Tips section
+        tips_title = Text("Tips for getting started", style="bold cyan underline")
+        tips = Table.grid(padding=(0, 1))
+        tips.add_column(style="cyan", no_wrap=True)
+        tips.add_column(style="dim")
+        tips.add_row("/help", "show all commands")
+        tips.add_row("/memory", "view loaded CLAUDE.md files")
+        tips.add_row("@file", "include a file in your message")
+
+        # Right column: Memory section
+        memory_title = Text("Memory", style="bold cyan underline")
+        sources = get_memory_sources()
+        if sources:
+            mem_body = Table.grid(padding=(0, 1))
+            mem_body.add_column(style="cyan", no_wrap=True)
+            mem_body.add_column(style="dim", no_wrap=True)
+            mem_body.add_column(justify="right", style="green")
+            for s in sources:
+                mem_body.add_row(s.label, str(s.path.name), f"{s.chars:,}")
+        else:
+            mem_body = Text(
+                "No memory loaded. Create ./CLAUDE.md to add project rules.",
+                style="dim",
+            )
+
+        right = Group(
+            tips_title,
+            tips,
+            Text(""),
+            memory_title,
+            mem_body,
+        )
+
+        layout = Table.grid(expand=True, padding=(0, 2))
+        layout.add_column(ratio=1)
+        layout.add_column(ratio=1)
+        layout.add_row(left, right)
+
+        return Panel(
+            layout,
+            title=f"[bold cyan]My Claude Code[/bold cyan] [dim]v{APP_VERSION}[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
 
     def _show_help(self) -> None:
         """Display help information."""
@@ -217,9 +313,11 @@ class ClaudeCLI:
         commands_table.add_column("Description")
         commands_table.add_row("/help", "Show this help message")
         commands_table.add_row("/settings", "Display current configuration")
-        commands_table.add_row("/history", "Show conversation history summary")
-        commands_table.add_row("/clear", "Clear conversation history")
+        commands_table.add_row("/history", "Show current session's messages")
+        commands_table.add_row("/resume", "Continue the most recent previous session")
+        commands_table.add_row("/clear", "Clear the current session")
         commands_table.add_row("/undo", "Undo the last file edit")
+        commands_table.add_row("/memory", "Show loaded memory (CLAUDE.md files)")
         commands_table.add_row("/exit", "Exit the program")
 
         examples_table = Table(show_header=False, border_style="dim", pad_edge=False)
@@ -269,15 +367,87 @@ class ClaudeCLI:
         self.console.print(Panel(table, title="[bold]Current Settings[/bold]", border_style="cyan", padding=(0, 2)))
 
     def _show_history(self) -> None:
-        """Display conversation history summary."""
-        summary = self.history.get_summary()
+        """Display the current session's in-memory messages."""
+        if not self.messages:
+            self.console.print("[dim]No conversation history in this session.[/dim]")
+            return
         from rich.markup import escape
-        self.console.print(f"[dim]{escape(summary)}[/dim]")
+        lines = ["Conversation Summary:"]
+        for i, msg in enumerate(self.messages, 1):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if len(content) > 100:
+                content = content[:97] + "..."
+            lines.append(f"{i}. {role}: {content}")
+        self.console.print(f"[dim]{escape(chr(10).join(lines))}[/dim]")
 
     def _clear_history(self) -> None:
-        """Clear conversation history."""
+        """Clear the current session (both in-memory and its jsonl file)."""
+        self.messages = []
         self.history.clear()
         self.console.print("[green]\u2713[/green] Conversation history cleared.")
+
+    def _resume(self) -> None:
+        """Load the most recent previous session into the current context.
+
+        Subsequent messages continue writing into the resumed session's file,
+        matching Claude Code's `--resume` semantics.
+        """
+        previous = list_sessions(limit=5, exclude=self.history.history_file)
+        if not previous:
+            self.console.print("[dim]No previous sessions to resume.[/dim]")
+            return
+
+        target = previous[0]
+        loaded = self.history.resume_from(target)
+
+        # Translate persisted jsonl entries into LLM-API message format.
+        self.messages = []
+        for entry in loaded:
+            role = entry.get("role")
+            content = entry.get("content", "")
+            if role == "user":
+                self.messages.append({"role": "user", "content": content})
+            elif role == "assistant" and content:
+                self.messages.append({"role": "assistant", "content": content})
+            elif role == "tool":
+                self.messages.append({
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": entry.get("tool_call_id", ""),
+                })
+
+        self.console.print(
+            f"[green]\u2713[/green] Resumed [cyan]{target.name}[/cyan] "
+            f"— {len(self.messages)} message(s) loaded."
+        )
+
+    def _show_memory(self) -> None:
+        """Display which CLAUDE.md files are loaded into the system prompt."""
+        sources = get_memory_sources()
+        if not sources:
+            self.console.print(
+                "[dim]No memory loaded. Create [cyan]./CLAUDE.md[/cyan] or "
+                "[cyan]~/.claude/CLAUDE.md[/cyan] to add persistent instructions.[/dim]"
+            )
+            return
+
+        table = Table(show_header=True, header_style="bold cyan", border_style="dim", pad_edge=False)
+        table.add_column("Layer", style="cyan", width=8)
+        table.add_column("Path")
+        table.add_column("Chars", justify="right", style="green")
+
+        total = 0
+        for src in sources:
+            table.add_row(src.label, str(src.path), f"{src.chars:,}")
+            total += src.chars
+
+        self.console.print(Panel(
+            table,
+            title=f"[bold]Loaded memory[/bold] ([green]{total:,}[/green] chars total)",
+            border_style="cyan",
+            padding=(0, 2),
+        ))
 
     def _undo(self) -> None:
         """Undo the last file edit."""
@@ -295,39 +465,53 @@ class ClaudeCLI:
 
     def run(self) -> None:
         """Main interactive loop."""
+        _trace("run() started")  # 日志: 函数入口
+
         # Check configuration
         if not is_configured():
+            _trace("is_configured() = False, running setup wizard")
             self.console.print("[yellow]First time setup required.[/yellow]\n")
             self._run_setup_wizard()
         else:
+            _trace("is_configured() = True, initializing LLM")
             self._init_llm()
 
+        _trace("LLM initialized, printing banner")
         self.console.print()
-        self.console.print(BANNER)
+        self.console.print(self._render_banner())
         self.console.print()
 
         # Create prompt session
+        _trace("Creating PromptSession")
         session = PromptSession(
             completer=SlashCommandCompleter(self.edit_tool),
             key_bindings=self._kb,
             auto_suggest=AutoSuggestFromHistory(),
         )
 
+        _trace("Entering main loop")
         while True:
             try:
+                _trace("session.prompt() waiting for user input...")
                 user_input = session.prompt("\u276f ")
+                _trace(f"User input received: {user_input[:50]!r}{'...' if len(user_input) > 50 else ''}")
             except KeyboardInterrupt:
+                _trace("KeyboardInterrupt received, continue")
                 continue
 
             if not user_input.strip():
+                _trace("Empty input, skip")
                 continue
 
             # Handle slash commands
             if user_input.startswith("/"):
+                _trace(f"Slash command detected: {user_input}")
                 if self._handle_slash_command(user_input):
+                    _trace("Slash command handled, continue loop")
                     continue
                 # Unknown command, continue to LLM
 
+            _trace("Calling _process_user_message()")
             # Process user message
             self._process_user_message(user_input)
 
@@ -358,11 +542,15 @@ class ClaudeCLI:
 
     def _process_user_message(self, message: str) -> None:
         """Process a user message through the LLM with agentic loop support."""
+        _trace(f"_process_user_message() called with: {message[:50]!r}{'...' if len(message) > 50 else ''}")
+
         # Expand @file references
         expanded_message = self._expand_file_references(message)
+        _trace(f"@file references expanded, expanded_message length: {len(expanded_message)}")
 
         # Add user message to history
-        self.history.add_message("user", expanded_message)
+        self._append_message("user", expanded_message)
+        _trace("User message added to history")
 
         # Agentic loop: keep calling LLM until it returns no more tool calls
         MAX_TOOL_LOOPS = 10
@@ -370,10 +558,12 @@ class ClaudeCLI:
 
         while loop_count < MAX_TOOL_LOOPS:
             loop_count += 1
+            _trace(f"Agentic loop iteration {loop_count}/{MAX_TOOL_LOOPS}")
             self.console.print(Rule(style="dim"))
 
             # Build messages from history
             messages = self._build_llm_messages()
+            _trace(f"Built {len(messages)} messages for LLM")
 
             try:
                 with self.console.status(
@@ -381,43 +571,60 @@ class ClaudeCLI:
                     spinner="dots",
                 ):
                     response = self._call_llm_with_retry(messages)
+                _trace(f"LLM response received, content length: {len(response.content) if response.content else 0}, tool_calls: {len(response.tool_calls) if response.tool_calls else 0}")
             except Exception as e:
+                _trace(f"Exception calling LLM: {e}")
                 self.console.print(f"[red]\u2717 Error calling LLM:[/red] {e}")
                 return
 
             # If no tool calls, this is the final response
             if not response.tool_calls:
+                _trace("No tool calls in response, this is final")
                 if response.content:
+                    _trace(f"Displaying markdown response, length: {len(response.content)}")
                     self._display_markdown(response.content)
-                    self.history.add_message("assistant", response.content)
+                    self._append_message("assistant", response.content)
                 else:
+                    _trace("Empty response from AI")
                     self.console.print("[yellow]AI returned empty response. The API may be unstable, please try again.[/yellow]")
                 break
 
             # Execute tools and continue loop
+            _trace(f"Executing {len(response.tool_calls)} tool call(s)")
             tool_results = self._execute_tools(response.content, response.tool_calls)
 
             # If user cancelled, stop the loop
             if tool_results.cancelled:
+                _trace("User cancelled, breaking loop")
                 break
 
+        _trace(f"_process_user_message() finished after {loop_count} iteration(s)")
+
+    def _append_message(
+        self,
+        role: str,
+        content: str,
+        tool_call_id: Optional[str] = None,
+    ) -> None:
+        """Append to in-memory context AND persist to this session's jsonl."""
+        msg: Dict[str, Any] = {"role": role, "content": content}
+        if tool_call_id:
+            msg["tool_call_id"] = tool_call_id
+        self.messages.append(msg)
+        self.history.add_message(role, content, tool_call_id=tool_call_id)
+
     def _build_llm_messages(self) -> List[Dict[str, str]]:
-        """Build messages list from conversation history."""
-        recent = self.history.load_recent(n=20)
-        messages = []
-        for msg in recent:
-            if msg["role"] == "user":
-                messages.append({"role": "user", "content": msg["content"]})
-            elif msg["role"] == "assistant":
-                content = msg.get("content", "")
-                if content:
-                    messages.append({"role": "assistant", "content": content})
-            elif msg["role"] == "tool":
-                messages.append({
-                    "role": "tool",
-                    "content": msg["content"],
-                    "tool_call_id": msg.get("tool_call_id", "")
-                })
+        """LLM messages = CLAUDE.md system prompt + in-memory session context.
+
+        New launches start with an empty context; /resume fills it from a
+        previous session file. No automatic cross-session replay — that
+        behavior belongs to CLAUDE.md, not session history.
+        """
+        messages: List[Dict[str, str]] = []
+        system_prompt = build_system_prompt()
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(self.messages)
         return messages
 
     def _expand_file_references(self, message: str) -> str:
@@ -468,6 +675,8 @@ class ClaudeCLI:
         Returns:
             ToolExecutionResult indicating if the user cancelled.
         """
+        _trace(f"_execute_tools() called with {len(tool_calls)} tool_call(s)")
+
         # If there's content, display it first
         if content:
             self._display_markdown(content)
@@ -475,6 +684,7 @@ class ClaudeCLI:
         for tool_call in tool_calls:
             tool_name = tool_call.name
             args = tool_call.arguments
+            _trace(f"Executing tool: {tool_name}, args keys: {list(args.keys())}")
 
             self.console.print(f"[dim]\u2699 Calling tool: [cyan]{tool_name}[/cyan]...[/dim]")
 
@@ -537,37 +747,41 @@ class ClaudeCLI:
 
             except PathSecurityError as e:
                 self.console.print(f"[red]\u2717 Security Error:[/red] {e}")
-                self.history.add_message("tool", f"Error: {e}")
+                self._append_message("tool", f"Error: {e}", tool_call_id=tool_call.id)
             except FileToolError as e:
                 self.console.print(f"[red]\u2717 File Error:[/red] {e}")
-                self.history.add_message("tool", f"Error: {e}")
+                self._append_message("tool", f"Error: {e}", tool_call_id=tool_call.id)
             except Exception as e:
                 self.console.print(f"[red]\u2717 Error:[/red] {e}")
-                self.history.add_message("tool", f"Error: {e}")
+                self._append_message("tool", f"Error: {e}", tool_call_id=tool_call.id)
 
         # Check if last operation was cancelled (flag set by _report_tool_result)
         return self.ToolExecutionResult(cancelled=self._last_tool_cancelled)
 
     def _report_tool_result(self, tool_call_id: str, result: Dict[str, Any]) -> None:
         """Report the result of a tool execution."""
+        _trace(f"_report_tool_result() called, success={result.get('success')}, needs_confirmation={result.get('needs_confirmation')}")
         self._last_tool_cancelled = False  # Reset on each tool
 
         if result.get("needs_confirmation"):
             # Show diff and request confirmation
             # _request_confirmation handles history logging internally
+            _trace("Tool needs confirmation, calling _request_confirmation()")
             self._request_confirmation(result, tool_call_id)
             return
 
         # Report success/failure
         if result["success"]:
+            _trace(f"Tool succeeded: {result['message'][:80]}")
             self.console.print(f"[green]\u2713[/green] {result['message']}")
         else:
+            _trace(f"Tool failed: {result['message'][:80]}")
             self.console.print(f"[red]\u2717[/red] {result['message']}")
 
-        self.history.add_message(
+        self._append_message(
             "tool",
             result["message"],
-            tool_call_id=tool_call_id
+            tool_call_id=tool_call_id,
         )
 
     def _request_confirmation(self, result: Dict[str, Any], tool_call_id: str) -> None:
@@ -617,7 +831,7 @@ class ClaudeCLI:
                     self.console.print(f"[green]\u2713[/green] {create_result['message']}")
                 else:
                     self.console.print(f"[red]\u2717[/red] {create_result['message']}")
-                self.history.add_message("tool", create_result["message"], tool_call_id=tool_call_id)
+                self._append_message("tool", create_result["message"], tool_call_id=tool_call_id)
             else:
                 # This was an edit operation
                 edit_result = self.edit_tool.confirm_edit()
@@ -625,11 +839,11 @@ class ClaudeCLI:
                     self.console.print(f"[green]\u2713[/green] {edit_result['message']}")
                 else:
                     self.console.print(f"[red]\u2717[/red] {edit_result['message']}")
-                self.history.add_message("tool", edit_result["message"], tool_call_id=tool_call_id)
+                self._append_message("tool", edit_result["message"], tool_call_id=tool_call_id)
         else:
             msg = "Operation cancelled."
             self.console.print(f"[yellow]\u2717[/yellow] {msg}")
-            self.history.add_message("tool", msg, tool_call_id=tool_call_id)
+            self._append_message("tool", msg, tool_call_id=tool_call_id)
             self._last_tool_cancelled = True
 
     def _display_markdown(self, content: str) -> None:

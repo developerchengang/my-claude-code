@@ -1,4 +1,8 @@
-"""Session history management for Claude CLI."""
+"""Session history management for Claude CLI.
+
+One JSONL file per session under .myai/sessions/. The current session writes
+into its own file; `/resume` picks a previous file to continue from.
+"""
 
 import json
 from datetime import datetime
@@ -6,22 +10,29 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 
+SESSIONS_DIR = ".myai/sessions"
+
+
 class SessionHistory:
-    """Manages conversation history stored in .myai/session.jsonl."""
+    """Append-only conversation log for the current session."""
 
     def __init__(self, history_file: Optional[Path] = None):
         if history_file is None:
-            history_file = Path.cwd() / ".myai" / "session.jsonl"
+            # Lazy: file is created on first add_message, so an empty session
+            # leaves no artifact on disk.
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            history_file = Path.cwd() / SESSIONS_DIR / f"session-{timestamp}.jsonl"
         self.history_file = history_file
-        self._ensure_directory()
-
-    def _ensure_directory(self) -> None:
-        """Ensure the history directory exists."""
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def add_message(self, role: str, content: str, tool_calls: Optional[List[Dict]] = None, tool_call_id: Optional[str] = None) -> None:
-        """Append a message to the history file in JSONL format."""
-        message = {
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        tool_calls: Optional[List[Dict]] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> None:
+        message: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "role": role,
             "content": content,
@@ -34,55 +45,55 @@ class SessionHistory:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
-    def load_recent(self, n: int = 10) -> List[Dict[str, Any]]:
-        """Load the most recent n messages from history."""
-        if not self.history_file.exists():
-            return []
-
-        messages = []
-        try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-            # Get last n lines
-            for line in lines[-n:]:
-                line = line.strip()
-                if line:
-                    try:
-                        messages.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except (IOError, OSError):
-            pass
-
+    def resume_from(self, path: Path) -> List[Dict[str, Any]]:
+        """Switch writes to an existing session file and return its messages."""
+        messages = _load_all(path)
+        self.history_file = path
         return messages
 
     def clear(self) -> None:
-        """Clear all history."""
         if self.history_file.exists():
             self.history_file.unlink()
 
-    def get_summary(self) -> str:
-        """Return a summary string of the conversation history."""
-        messages = self.load_recent(n=20)
 
-        if not messages:
-            return "No conversation history."
+def list_sessions(limit: int = 10, exclude: Optional[Path] = None) -> List[Path]:
+    """Previous session files, newest first. Excludes the given path if provided."""
+    sessions_dir = Path.cwd() / SESSIONS_DIR
+    if not sessions_dir.exists():
+        return []
+    files = sorted(
+        sessions_dir.glob("session-*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if exclude is not None and exclude.exists():
+        exclude_resolved = exclude.resolve()
+        files = [f for f in files if f.resolve() != exclude_resolved]
+    return files[:limit]
 
-        summary_lines = ["Conversation Summary:"]
-        for i, msg in enumerate(messages, 1):
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
 
-            # Truncate long content
-            if len(content) > 100:
-                content = content[:97] + "..."
+def preview_session(path: Path) -> str:
+    """One-line preview: message count + first user message."""
+    messages = _load_all(path)
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    preview = first_user["content"] if first_user else "(empty)"
+    preview = preview.replace("\n", " ")
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    return f"{len(messages):>3} msgs | {preview}"
 
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                tool_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls]
-                summary_lines.append(f"{i}. [tool] {role}: {', '.join(tool_names)}")
-            else:
-                summary_lines.append(f"{i}. {role}: {content}")
 
-        return "\n".join(summary_lines)
+def _load_all(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    messages: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                messages.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return messages
