@@ -18,6 +18,7 @@ from rich.rule import Rule
 
 from config import Config
 from history import SessionHistory, list_sessions
+from hooks import load_hooks, run_hooks
 from llm import LLMClient, LLMResponse, ToolCall
 from memory import build_system_prompt
 from models import get_context_window
@@ -86,6 +87,8 @@ class Agent:
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.plan_mode = False
+        self.hooks = load_hooks()
+        self._warn_hook_errors()
 
     # ---- public API ---------------------------------------------------
 
@@ -213,6 +216,12 @@ class Agent:
     def undo_last_edit(self) -> Dict[str, Any]:
         return self.edit_tool.undo_last()
 
+    def _warn_hook_errors(self) -> None:
+        errors = self.hooks.pop("_error", None)
+        if errors:
+            for e in errors:
+                self.console.print(f"[yellow]\u26a0 {e}[/yellow]")
+
     # ---- LLM plumbing -------------------------------------------------
 
     def _call_llm_with_retry(self, messages, max_retries: int = 3) -> LLMResponse:
@@ -328,6 +337,21 @@ class Agent:
             self.console.print(
                 f"[dim]\u2699 Calling tool: [cyan]{tool_call.name}[/cyan]...[/dim]"
             )
+
+            pre = run_hooks(
+                self.hooks.get("pre_tool_use"),
+                tool_call.name,
+                tool_call.arguments,
+            )
+            if pre.blocked:
+                self.console.print(f"[red]\u2717 Hook blocked:[/red] {pre.reason}")
+                self._append_message(
+                    "tool",
+                    f"Blocked by pre_tool_use hook: {pre.reason}",
+                    tool_call_id=tool_call.id,
+                )
+                continue
+
             try:
                 result = self._dispatch_tool(tool_call)
             except PathSecurityError as e:
@@ -345,6 +369,14 @@ class Agent:
 
             if self._handle_tool_result(tool_call.id, result):
                 cancelled = True
+
+            post = run_hooks(
+                self.hooks.get("post_tool_use"),
+                tool_call.name,
+                tool_call.arguments,
+            )
+            if post.stdout:
+                self.console.print(f"[dim]\u2192 hook: {post.stdout}[/dim]")
 
         return cancelled
 
