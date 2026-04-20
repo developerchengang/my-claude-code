@@ -402,6 +402,16 @@ class Agent:
         if name == "task":
             return self._run_subagent(args.get("description", ""))
 
+        if name == "web_fetch":
+            from web import fetch_url
+            fr = fetch_url(args.get("url", ""), args.get("query"))
+            return {
+                "success": fr.success,
+                "message": fr.message,
+                "url": fr.url,
+                "title": fr.title,
+            }
+
         if name == "read_file":
             result = self.read_tool.read_file(args["file_path"])
             if "message" not in result:
