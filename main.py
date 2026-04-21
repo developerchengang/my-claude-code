@@ -444,14 +444,25 @@ class ClaudeCLI:
     # ---- confirmation callback (passed into Agent) -------------------
 
     def _confirm(self, result: Dict[str, Any]) -> bool:
-        """Render diff and ask y/N. Invoked by Agent for destructive tools."""
+        """Render diff or command and ask y/N. Invoked by Agent for destructive tools."""
         self._pending_confirmation = True
 
         diff = result.get("diff")
+        command = result.get("command")
         if diff:
             syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
             self.console.print(Panel(
                 syntax, title="[bold]Proposed changes[/bold]",
+                border_style="yellow", padding=(0, 1),
+            ))
+        elif command:
+            description = result.get("description") or ""
+            timeout = result.get("timeout", "")
+            body = Syntax(command, "bash", theme="monokai", word_wrap=True)
+            subtitle = f"timeout {timeout}s" + (f" · {description}" if description else "")
+            self.console.print(Panel(
+                body, title="[bold]Run command[/bold]",
+                subtitle=f"[dim]{subtitle}[/dim]",
                 border_style="yellow", padding=(0, 1),
             ))
 

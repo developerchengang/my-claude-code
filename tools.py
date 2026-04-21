@@ -3,6 +3,7 @@
 import difflib
 import hashlib
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -700,3 +701,126 @@ class GrepTool:
                 applied_limit=applied_limit,
                 applied_offset=applied_offset,
             )
+
+
+class BashTool:
+    """Execute shell commands with a confirmation checkpoint.
+
+    Like ``FileEditTool``, execution is two-phase: ``run`` prepares a
+    pending command and returns ``needs_confirmation``; ``confirm_run``
+    actually invokes ``subprocess.run``. This lets the CLI render the
+    command for y/N approval before anything hits the shell.
+    """
+
+    DEFAULT_TIMEOUT = 120
+    MAX_TIMEOUT = 600
+    MAX_OUTPUT_CHARS = 30000
+
+    def __init__(self, project_root: Optional[Path] = None):
+        self.project_root = project_root or Path.cwd()
+        self._pending: Optional[Dict[str, Any]] = None
+
+    def run(
+        self,
+        command: str,
+        description: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not command or not command.strip():
+            raise FileToolError("bash: 'command' is required.")
+
+        effective_timeout = min(timeout or self.DEFAULT_TIMEOUT, self.MAX_TIMEOUT)
+
+        self._pending = {
+            "command": command,
+            "description": description or "",
+            "timeout": effective_timeout,
+        }
+
+        return {
+            "success": True,
+            "message": f"Command prepared: {command}",
+            "needs_confirmation": True,
+            "command": command,
+            "description": description or "",
+            "timeout": effective_timeout,
+        }
+
+    def confirm_run(self) -> Dict[str, Any]:
+        if self._pending is None:
+            return {"success": False, "message": "No pending command to run."}
+
+        pending = self._pending
+        self._pending = None
+
+        command = pending["command"]
+        timeout = pending["timeout"]
+
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.project_root),
+            )
+        except subprocess.TimeoutExpired as e:
+            partial_stdout = self._decode(e.stdout)
+            partial_stderr = self._decode(e.stderr)
+            return {
+                "success": False,
+                "message": self._format_output(
+                    partial_stdout, partial_stderr,
+                    header=f"Command timed out after {timeout}s.",
+                    returncode=None,
+                ),
+            }
+        except OSError as e:
+            return {"success": False, "message": f"Failed to run command: {e}"}
+
+        return {
+            "success": completed.returncode == 0,
+            "message": self._format_output(
+                completed.stdout or "", completed.stderr or "",
+                header=None, returncode=completed.returncode,
+            ),
+            "returncode": completed.returncode,
+        }
+
+    @staticmethod
+    def _decode(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        return raw
+
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.MAX_OUTPUT_CHARS:
+            return text
+        overflow = len(text) - self.MAX_OUTPUT_CHARS
+        return text[:self.MAX_OUTPUT_CHARS] + f"\n... [truncated, {overflow} more chars]"
+
+    def _format_output(
+        self,
+        stdout: str,
+        stderr: str,
+        header: Optional[str],
+        returncode: Optional[int],
+    ) -> str:
+        parts: List[str] = []
+        if header:
+            parts.append(header)
+        stdout = self._truncate(stdout.rstrip())
+        stderr = self._truncate(stderr.rstrip())
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+        if returncode is not None:
+            parts.append(f"[exit {returncode}]")
+        return "\n".join(parts) if parts else "(no output)"
+
+    def get_pending_command(self) -> Optional[str]:
+        return self._pending["command"] if self._pending else None

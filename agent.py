@@ -23,6 +23,7 @@ from llm import LLMClient, LLMResponse, ToolCall
 from memory import build_system_prompt
 from models import get_context_window
 from tools import (
+    BashTool,
     FileEditTool,
     FileReadTool,
     FileToolError,
@@ -53,8 +54,9 @@ class Agent:
     KEEP_RECENT_ON_COMPACT = 2
     MAX_FILE_INLINE_CHARS = 5000
 
-    # Tools that mutate the filesystem; blocked in plan mode or for sub-agents.
-    WRITE_TOOLS = frozenset({"create_file", "edit_file"})
+    # Tools that can mutate state; blocked in plan mode or for sub-agents.
+    # `bash` is included because shell commands are opaque — assume worst case.
+    WRITE_TOOLS = frozenset({"create_file", "edit_file", "bash"})
     # Tools hidden from sub-agents (so they cannot recursively spawn).
     SUBAGENT_DISABLED_TOOLS = frozenset({"task"})
 
@@ -88,6 +90,7 @@ class Agent:
         self.write_tool = FileWriteTool()
         self.edit_tool = FileEditTool(read_tool=self.read_tool)
         self.grep_tool = GrepTool()
+        self.bash_tool = BashTool()
 
         self.history = SessionHistory(persist=persist_history)
         self.messages: List[Dict[str, Any]] = []
@@ -406,6 +409,13 @@ class Agent:
         if name == "task":
             return self._run_subagent(args.get("description", ""))
 
+        if name == "bash":
+            return self.bash_tool.run(
+                command=args.get("command", ""),
+                description=args.get("description"),
+                timeout=args.get("timeout"),
+            )
+
         if name == "web_fetch":
             from web import fetch_url
             fr = fetch_url(args.get("url", ""), args.get("query"))
@@ -528,7 +538,9 @@ class Agent:
         return False
 
     def _apply_confirmed(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        # A create result carries `content` but no `diff`; an edit carries `diff`.
+        # Bash carries `command`; create carries `content` (no `diff`); edit carries `diff`.
+        if "command" in result:
+            return self.bash_tool.confirm_run()
         if "content" in result and "diff" not in result:
             return self.write_tool.confirm_create(
                 result.get("file_path", ""),

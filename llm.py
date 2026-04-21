@@ -95,6 +95,30 @@ OPENAI_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "bash",
+            "description": (
+                "Execute a shell command and return its stdout/stderr/exit code. "
+                "Runs with shell=True in the project directory. Use for running "
+                "tests, checking git state, listing files, building, installing "
+                "packages, etc. Each call requires user approval before the "
+                "command runs. Prefer dedicated tools (read_file, edit_file, "
+                "grep) over bash equivalents (cat, sed, grep). Avoid interactive "
+                "commands (vim, less, top) — they will hang."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute."},
+                    "description": {"type": "string", "description": "Short (5-10 word) description of what the command does, shown to the user on approval."},
+                    "timeout": {"type": "integer", "description": "Optional timeout in seconds (default 120, max 600)."}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_fetch",
             "description": (
                 "Fetch a static web page and return its main-content text. "
@@ -192,6 +216,27 @@ ANTHROPIC_TOOL_DEFINITIONS = [
                 "replace_all": {"type": "boolean"}
             },
             "required": ["file_path", "old_string", "new_string"]
+        }
+    },
+    {
+        "name": "bash",
+        "description": (
+            "Execute a shell command and return its stdout/stderr/exit code. "
+            "Runs with shell=True in the project directory. Use for running "
+            "tests, checking git state, listing files, building, installing "
+            "packages, etc. Each call requires user approval before the "
+            "command runs. Prefer dedicated tools (read_file, edit_file, "
+            "grep) over bash equivalents (cat, sed, grep). Avoid interactive "
+            "commands (vim, less, top) — they will hang."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute."},
+                "description": {"type": "string", "description": "Short (5-10 word) description of what the command does."},
+                "timeout": {"type": "integer", "description": "Optional timeout in seconds (default 120, max 600)."}
+            },
+            "required": ["command"]
         }
     },
     {
