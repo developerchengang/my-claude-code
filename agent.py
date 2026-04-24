@@ -428,8 +428,13 @@ class Agent:
 
         if name == "read_file":
             result = self.read_tool.read_file(args["file_path"])
-            if "message" not in result:
-                result["message"] = result.get("content", "")[:500]
+            if result.get("success"):
+                # LLM needs the full file; truncating here is what caused the
+                # model to see only the head of the file on every read.
+                result["message"] = result.get("content", "")
+                num_lines = result.get("num_lines", 0)
+                fname = Path(result.get("file_path", args["file_path"])).name
+                result["display"] = f"Read {num_lines} lines from {fname}"
             return result
 
         if name == "create_file":
@@ -550,7 +555,8 @@ class Agent:
 
     def _print_status(self, result: Dict[str, Any]) -> None:
         mark = "[green]\u2713[/green]" if result.get("success") else "[red]\u2717[/red]"
-        self.console.print(f"{mark} {result['message']}")
+        text = result.get("display") or result.get("message", "")
+        self.console.print(f"{mark} {text}")
 
     def _display_markdown(self, content: str) -> None:
         self.console.print(Markdown(content))
