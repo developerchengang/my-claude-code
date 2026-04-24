@@ -180,6 +180,7 @@ class ClaudeCLI:
             model=self.config.model,
             temperature=self.config.temperature,
             provider=provider,
+            max_output_tokens=self.config.max_output_tokens,
         )
         self.agent = Agent(
             llm=llm,

@@ -16,6 +16,11 @@ class Config:
         "model": "gpt-4o",
         "temperature": 0.7,
         "max_history_tokens": 4096,
+        # Per-response output cap. Anthropic's API *requires* max_tokens, and
+        # 4096 is too small for long code generations (a full HTML game runs
+        # ~8-15k output tokens). Users with Claude models can safely raise
+        # this to 16k-64k.
+        "max_output_tokens": 8192,
         "theme": "dark",
     }
 
@@ -73,6 +78,10 @@ class Config:
     @property
     def max_history_tokens(self) -> int:
         return self._settings.get("max_history_tokens", 4096)
+
+    @property
+    def max_output_tokens(self) -> int:
+        return self._settings.get("max_output_tokens", 8192)
 
 
 def is_configured() -> bool:

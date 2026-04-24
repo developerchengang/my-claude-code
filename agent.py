@@ -53,6 +53,19 @@ class Agent:
     AUTO_COMPACT_THRESHOLD = 0.8
     KEEP_RECENT_ON_COMPACT = 2
     MAX_FILE_INLINE_CHARS = 5000
+    # Auto-continue on output truncation. When a reply is cut off by
+    # max_tokens, we feed the model back its own half-response plus this
+    # meta prompt and let it resume. Wording is copied verbatim from the
+    # official Claude Code (query.ts:1225) because it is specifically tuned
+    # to prevent the model from apologizing or recapping instead of
+    # resuming mid-thought.
+    MAX_CONTINUE_ATTEMPTS = 3
+    CONTINUE_META_PROMPT = (
+        "Output token limit hit. Resume directly — no apology, "
+        "no recap of what you were doing. Pick up mid-thought if "
+        "that is where the cut happened. Break remaining work into "
+        "smaller pieces."
+    )
 
     # Tools that can mutate state; blocked in plan mode or for sub-agents.
     # `bash` is included because shell commands are opaque — assume worst case.
@@ -108,6 +121,8 @@ class Agent:
         self._append_message("user", expanded)
         self._maybe_auto_compact()
 
+        continue_attempts = 0
+
         for i in range(self.MAX_TOOL_LOOPS):
             _trace(f"agent loop iteration {i + 1}/{self.MAX_TOOL_LOOPS}")
             self.console.print(Rule(style="dim"))
@@ -125,6 +140,16 @@ class Agent:
                 if response.content:
                     self._display_markdown(response.content)
                     self._append_message("assistant", response.content)
+                    if response.truncated:
+                        if continue_attempts < self.MAX_CONTINUE_ATTEMPTS:
+                            continue_attempts += 1
+                            self.console.print(
+                                f"[dim]\u2192 Output truncated, auto-continuing "
+                                f"({continue_attempts}/{self.MAX_CONTINUE_ATTEMPTS})...[/dim]"
+                            )
+                            self._append_message("user", self.CONTINUE_META_PROMPT)
+                            continue
+                        self._warn_truncated()
                 else:
                     self.console.print(
                         "[yellow]AI returned empty response. "
@@ -132,9 +157,19 @@ class Agent:
                     )
                 return
 
+            if response.truncated:
+                # Truncation mid-tool-call usually means the tool_use JSON is
+                # malformed. Surface it so the user isn't confused by the
+                # downstream error. Auto-continue doesn't help here \u2014 the
+                # tool call is already committed.
+                self._warn_truncated()
+
             cancelled = self._execute_tools(response.content, response.tool_calls)
             if cancelled:
                 return
+            # Reset continue budget: tool calls mean the model moved past the
+            # truncated text into new work.
+            continue_attempts = 0
 
     def compact(self) -> None:
         """Summarize history via the LLM and keep only a short tail verbatim.
@@ -560,3 +595,11 @@ class Agent:
 
     def _display_markdown(self, content: str) -> None:
         self.console.print(Markdown(content))
+
+    def _warn_truncated(self) -> None:
+        cap = self.llm.max_output_tokens
+        self.console.print(
+            f"[yellow]⚠ Output truncated at max_output_tokens={cap}.[/yellow] "
+            f"[dim]Raise it in ~/.myai/settings.json (e.g. 16384 or 32768 for "
+            f"Claude models), or ask the assistant to continue from the cutoff.[/dim]"
+        )

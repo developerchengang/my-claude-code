@@ -24,6 +24,11 @@ class LLMResponse:
     tool_calls: List[ToolCall] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    # True when the response was cut off by the output token limit
+    # (Anthropic stop_reason="max_tokens" / OpenAI finish_reason="length").
+    # The agent uses this to surface a clear warning instead of silently
+    # printing a truncated reply.
+    truncated: bool = False
 
 
 # OpenAI tool definitions (function calling format)
@@ -283,13 +288,15 @@ class LLMClient:
         base_url: str,
         model: str,
         temperature: float = 0.7,
-        provider: str = "openai"
+        provider: str = "openai",
+        max_output_tokens: int = 8192,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.provider = provider.lower()
+        self.max_output_tokens = max_output_tokens
         self._openai_client: Optional[openai.OpenAI] = None
         self._anthropic_client: Optional[anthropic.Anthropic] = None
 
@@ -339,6 +346,7 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
         }
 
         if tools:
@@ -354,11 +362,13 @@ class LLMClient:
         if not choices:
             return LLMResponse(content="", tool_calls=[])
 
-        message = choices[0].message
+        choice = choices[0]
+        message = choice.message
         if message is None:
             return LLMResponse(content="", tool_calls=[])
 
         content = message.content or ""
+        truncated = getattr(choice, "finish_reason", None) == "length"
 
         tool_calls = []
         for tc in (message.tool_calls or []):
@@ -381,6 +391,7 @@ class LLMClient:
             tool_calls=tool_calls,
             input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
             output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            truncated=truncated,
         )
 
     def _chat_anthropic(
@@ -417,7 +428,7 @@ class LLMClient:
         request_kwargs = {
             "model": self.model,
             "messages": anthropic_messages,
-            "max_tokens": 4096,
+            "max_tokens": self.max_output_tokens,
         }
 
         if system_parts:
@@ -453,4 +464,5 @@ class LLMClient:
             tool_calls=tool_calls,
             input_tokens=getattr(usage, "input_tokens", 0) or 0,
             output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            truncated=getattr(response, "stop_reason", None) == "max_tokens",
         )
